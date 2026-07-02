@@ -47,5 +47,5 @@ fi
 # Create logs directory if it doesn't exist
 mkdir -p logs
 
-# Start the MCP server (this will handle stdin/stdout communication with Cursor)
+# Start the MCP server (listens over HTTP, e.g. http://127.0.0.1:8000/mcp)
 exec python src/wiki_mcp_server.py 

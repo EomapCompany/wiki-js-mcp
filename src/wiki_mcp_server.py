@@ -18,6 +18,9 @@ from dataclasses import dataclass
 
 import httpx
 from fastmcp import FastMCP
+from fastmcp.server.auth import AccessToken, TokenVerifier
+from fastmcp.server.auth.oidc_proxy import OIDCConfiguration, OIDCProxy
+from fastmcp.server.auth.providers.jwt import JWTVerifier
 from slugify import slugify
 import markdown
 from sqlalchemy import create_engine, Column, Integer, String, DateTime, Text
@@ -27,12 +30,75 @@ from tenacity import retry, stop_after_attempt, wait_exponential
 from pydantic import Field
 from pydantic_settings import BaseSettings
 
+
+class RealmRoleVerifier(TokenVerifier):
+    """Wraps a TokenVerifier and additionally requires a Keycloak realm role."""
+
+    def __init__(self, inner: TokenVerifier, required_role: str):
+        super().__init__(
+            base_url=inner.base_url,
+            required_scopes=inner.required_scopes,
+            resource_base_url=inner.resource_base_url,
+        )
+        self._inner = inner
+        self._required_role = required_role
+
+    async def verify_token(self, token: str) -> Optional[AccessToken]:
+        access_token = await self._inner.verify_token(token)
+        if access_token is None:
+            return None
+        roles = (access_token.claims or {}).get("realm_access", {}).get("roles", [])
+        if self._required_role not in roles:
+            logging.getLogger(__name__).warning(
+                "Rejected token for client %s: missing realm role '%s'",
+                access_token.client_id,
+                self._required_role,
+            )
+            return None
+        return access_token
+
+
+# OIDC auth via Keycloak (required for HTTP transport; not used over stdio)
+# For a public Keycloak client (Standard Flow, no client secret), leave
+# OIDC_CLIENT_SECRET unset and provide OIDC_JWT_SIGNING_KEY instead.
+# Set OIDC_REQUIRED_REALM_ROLE to restrict access to users holding that realm role.
+auth = None
+if os.getenv("OIDC_CLIENT_ID"):
+    client_secret = os.getenv("OIDC_CLIENT_SECRET")
+    config_url = os.getenv(
+        "OIDC_CONFIG_URL",
+        "https://auth.eomap.com/auth/realms/eomap/.well-known/openid-configuration",
+    )
+    required_role = os.getenv("OIDC_REQUIRED_REALM_ROLE")
+
+    token_verifier = None
+    if required_role:
+        oidc_config = OIDCConfiguration.get_oidc_configuration(
+            config_url, strict=None, timeout_seconds=None
+        )
+        token_verifier = RealmRoleVerifier(
+            JWTVerifier(
+                jwks_uri=str(oidc_config.jwks_uri),
+                issuer=str(oidc_config.issuer),
+            ),
+            required_role,
+        )
+
+    auth = OIDCProxy(
+        config_url=config_url,
+        client_id=os.getenv("OIDC_CLIENT_ID"),
+        client_secret=client_secret,
+        jwt_signing_key=os.getenv("OIDC_JWT_SIGNING_KEY") if not client_secret else None,
+        base_url=os.getenv("MCP_BASE_URL", "http://127.0.0.1:8000"),
+        token_verifier=token_verifier,
+    )
+
 # Create FastMCP server
-mcp = FastMCP("Wiki.js Integration")
+mcp = FastMCP("Wiki.js Integration", auth=auth)
 
 # Configuration
 class Settings(BaseSettings):
-    WIKIJS_API_URL: str = Field(default="http://localhost:3000")
+    WIKIJS_API_URL: str = Field(default="http://127.0.0.1:3000")
     WIKIJS_TOKEN: Optional[str] = Field(default=None)
     WIKIJS_API_KEY: Optional[str] = Field(default=None)  # Alternative name for token
     WIKIJS_USERNAME: Optional[str] = Field(default=None)
@@ -2054,8 +2120,12 @@ def main():
         await wikijs.authenticate()
         logger.info("Wiki.js MCP Server started")
         
-    # Run the server
-    mcp.run()
+    # Run the server over HTTP (required for OIDC login via Keycloak)
+    mcp.run(
+        transport="http",
+        host=os.getenv("MCP_HTTP_HOST", "127.0.0.1"),
+        port=int(os.getenv("MCP_HTTP_PORT", "8000")),
+    )
 
 if __name__ == "__main__":
     main() 

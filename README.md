@@ -22,7 +22,7 @@ cp config/example.env .env
 # Start Wiki.js with Docker
 docker-compose -f docker.yml up -d
 ```
-Wiki.js will be available at http://localhost:3000
+Wiki.js will be available at http://127.0.0.1:3000
 
 Complete the initial setup in the web interface
 
@@ -263,7 +263,7 @@ POSTGRES_USER=wikijs
 POSTGRES_PASSWORD=your_secure_password_here
 
 # Wiki.js Connection
-WIKIJS_API_URL=http://localhost:3000
+WIKIJS_API_URL=http://127.0.0.1:3000
 WIKIJS_API_KEY=your_jwt_token_here
 
 # Alternative: Username/Password
@@ -358,7 +358,7 @@ docker-compose -f docker.yml up -d
 ### Connection Issues
 ```bash
 # Check Wiki.js is running
-curl http://localhost:3000/graphql
+curl http://127.0.0.1:3000/graphql
 
 # Verify authentication
 ./test-server.sh
