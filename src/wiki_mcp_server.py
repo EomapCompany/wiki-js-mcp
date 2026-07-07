@@ -4,7 +4,6 @@
 import os
 
 from dotenv import load_dotenv
-from mcp.server.transport_security import TransportSecuritySettings
 
 load_dotenv()
 
@@ -93,14 +92,7 @@ if os.getenv("OIDC_CLIENT_ID"):
     )
 
 # Create FastMCP server
-mcp = FastMCP("Wiki.js Integration",
-              auth=auth,
-              transport_security=TransportSecuritySettings(
-                  enable_dns_rebinding_protection=True,
-                  allowed_hosts=["mcp.wiki.eomap.com", "localhost:*", "127.0.0.1:*"],
-                  allowed_origins=["https://mcp.wiki.eomap.com", "http://localhost:*"],
-              ),
-              )
+mcp = FastMCP("Wiki.js Integration", auth=auth)
 
 
 # Configuration
