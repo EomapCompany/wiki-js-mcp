@@ -2,19 +2,19 @@
 """Wiki.js MCP server using FastMCP - GraphQL version."""
 
 import os
+
 from dotenv import load_dotenv
+from mcp.server.transport_security import TransportSecuritySettings
+
 load_dotenv()
 
-import sys
 import datetime
 import json
 import hashlib
 import logging
 import ast
-import re
 from pathlib import Path
-from typing import Optional, List, Dict, Any, Union
-from dataclasses import dataclass
+from typing import Optional, List, Dict, Any
 
 import httpx
 from fastmcp import FastMCP
@@ -23,9 +23,8 @@ from fastmcp.server.auth.oidc_proxy import OIDCConfiguration, OIDCProxy
 from fastmcp.server.auth.providers.jwt import JWTVerifier
 from slugify import slugify
 import markdown
-from sqlalchemy import create_engine, Column, Integer, String, DateTime, Text
+from sqlalchemy import create_engine, Column, Integer, String, DateTime
 from sqlalchemy.orm import declarative_base, sessionmaker
-from sqlalchemy.exc import SQLAlchemyError
 from tenacity import retry, stop_after_attempt, wait_exponential
 from pydantic import Field
 from pydantic_settings import BaseSettings
@@ -94,7 +93,15 @@ if os.getenv("OIDC_CLIENT_ID"):
     )
 
 # Create FastMCP server
-mcp = FastMCP("Wiki.js Integration", auth=auth)
+mcp = FastMCP("Wiki.js Integration",
+              auth=auth,
+              transport_security=TransportSecuritySettings(
+                  enable_dns_rebinding_protection=True,
+                  allowed_hosts=["mcp.wiki.eomap.com", "localhost:*", "127.0.0.1:*"],
+                  allowed_origins=["https://mcp.wiki.eomap.com", "http://localhost:*"],
+              ),
+              )
+
 
 # Configuration
 class Settings(BaseSettings):
@@ -108,15 +115,16 @@ class Settings(BaseSettings):
     LOG_FILE: str = Field(default="wikijs_mcp.log")
     REPOSITORY_ROOT: str = Field(default="./")
     DEFAULT_SPACE_NAME: str = Field(default="Documentation")
-    
+
     class Config:
         env_file = ".env"
         extra = "ignore"  # Allow extra fields without validation errors
-    
+
     @property
     def token(self) -> Optional[str]:
         """Get the token from either WIKIJS_TOKEN or WIKIJS_API_KEY."""
         return self.WIKIJS_TOKEN or self.WIKIJS_API_KEY
+
 
 settings = Settings()
 
@@ -134,9 +142,10 @@ logger = logging.getLogger(__name__)
 # Database models
 Base = declarative_base()
 
+
 class FileMapping(Base):
     __tablename__ = 'file_mappings'
-    
+
     id = Column(Integer, primary_key=True)
     file_path = Column(String, unique=True, nullable=False)
     page_id = Column(Integer, nullable=False)
@@ -146,28 +155,31 @@ class FileMapping(Base):
     repository_root = Column(String, default='')
     space_name = Column(String, default='')
 
+
 class RepositoryContext(Base):
     __tablename__ = 'repository_contexts'
-    
+
     id = Column(Integer, primary_key=True)
     root_path = Column(String, unique=True, nullable=False)
     space_name = Column(String, nullable=False)
     space_id = Column(Integer)
     last_updated = Column(DateTime, default=datetime.datetime.utcnow)
 
+
 # Database setup
 engine = create_engine(f"sqlite:///{settings.WIKIJS_MCP_DB}")
 Base.metadata.create_all(engine)
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 
+
 class WikiJSClient:
     """Wiki.js GraphQL API client for handling requests."""
-    
+
     def __init__(self):
         self.base_url = settings.WIKIJS_API_URL.rstrip('/')
         self.client = httpx.AsyncClient(timeout=30.0)
         self.authenticated = False
-        
+
     async def authenticate(self) -> bool:
         """Set up authentication headers for GraphQL requests."""
         if settings.token:
@@ -191,12 +203,12 @@ class WikiJSClient:
                     }
                 }
                 """
-                
+
                 response = await self.graphql_request(login_mutation, {
                     "username": settings.WIKIJS_USERNAME,
                     "password": settings.WIKIJS_PASSWORD
                 })
-                
+
                 if response.get("data", {}).get("authentication", {}).get("login", {}).get("succeeded"):
                     jwt_token = response["data"]["authentication"]["login"]["jwt"]
                     self.client.headers.update({
@@ -212,27 +224,27 @@ class WikiJSClient:
                 logger.error(f"Authentication failed: {e}")
                 return False
         return False
-    
+
     @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=4, max=10))
     async def graphql_request(self, query: str, variables: Dict = None) -> Dict:
         """Make GraphQL request to Wiki.js."""
         url = f"{self.base_url}/graphql"
-        
+
         payload = {"query": query}
         if variables:
             payload["variables"] = variables
-        
+
         try:
             response = await self.client.post(url, json=payload)
             response.raise_for_status()
-            
+
             data = response.json()
-            
+
             # Check for GraphQL errors
             if "errors" in data:
                 error_msg = "; ".join([err.get("message", str(err)) for err in data["errors"]])
                 raise Exception(f"GraphQL error: {error_msg}")
-            
+
             return data
         except httpx.HTTPStatusError as e:
             logger.error(f"Wiki.js GraphQL HTTP error {e.response.status_code}: {e.response.text}")
@@ -241,8 +253,10 @@ class WikiJSClient:
             logger.error(f"Wiki.js connection error: {str(e)}")
             raise Exception(f"Wiki.js connection error: {str(e)}")
 
+
 # Initialize client
 wikijs = WikiJSClient()
+
 
 def get_db():
     """Get database session."""
@@ -252,6 +266,7 @@ def get_db():
     finally:
         db.close()
 
+
 def get_file_hash(file_path: str) -> str:
     """Calculate SHA256 hash of file content."""
     try:
@@ -260,18 +275,20 @@ def get_file_hash(file_path: str) -> str:
     except FileNotFoundError:
         return ""
 
+
 def markdown_to_html(content: str) -> str:
     """Convert markdown content to HTML."""
     md = markdown.Markdown(extensions=['codehilite', 'fenced_code', 'tables'])
     return md.convert(content)
 
+
 def find_repository_root(start_path: str = None) -> Optional[str]:
     """Find the repository root by looking for .git directory or .wikijs_mcp file."""
     if start_path is None:
         start_path = os.getcwd()
-    
+
     current_path = Path(start_path).resolve()
-    
+
     # Walk up the directory tree
     for path in [current_path] + list(current_path.parents):
         # Check for .git directory (Git repository)
@@ -280,23 +297,24 @@ def find_repository_root(start_path: str = None) -> Optional[str]:
         # Check for .wikijs_mcp file (explicit Wiki.js repository marker)
         if (path / '.wikijs_mcp').exists():
             return str(path)
-    
+
     # If no repository markers found, use current directory
     return str(current_path)
+
 
 def extract_code_structure(file_path: str) -> Dict[str, Any]:
     """Extract classes and functions from Python files using AST."""
     try:
         with open(file_path, 'r', encoding='utf-8') as f:
             content = f.read()
-        
+
         tree = ast.parse(content)
         structure = {
             'classes': [],
             'functions': [],
             'imports': []
         }
-        
+
         for node in ast.walk(tree):
             if isinstance(node, ast.ClassDef):
                 structure['classes'].append({
@@ -318,11 +336,12 @@ def extract_code_structure(file_path: str) -> Dict[str, Any]:
                     module = node.module or ''
                     for alias in node.names:
                         structure['imports'].append(f"{module}.{alias.name}")
-        
+
         return structure
     except Exception as e:
         logger.error(f"Error parsing {file_path}: {e}")
         return {'classes': [], 'functions': [], 'imports': []}
+
 
 # MCP Tools Implementation
 
@@ -342,7 +361,7 @@ async def wikijs_create_page(title: str, content: str, space_id: str = "", paren
     """
     try:
         await wikijs.authenticate()
-        
+
         # Generate path - if parent_id provided, create nested path
         if parent_id:
             # Get parent page to build nested path
@@ -358,7 +377,7 @@ async def wikijs_create_page(title: str, content: str, space_id: str = "", paren
             """
             parent_response = await wikijs.graphql_request(parent_query, {"id": int(parent_id)})
             parent_data = parent_response.get("data", {}).get("pages", {}).get("single")
-            
+
             if parent_data:
                 parent_path = parent_data["path"]
                 # Create nested path: parent-path/child-title
@@ -367,7 +386,7 @@ async def wikijs_create_page(title: str, content: str, space_id: str = "", paren
                 path = slugify(title)
         else:
             path = slugify(title)
-        
+
         # GraphQL mutation to create a page
         mutation = """
         mutation($content: String!, $description: String!, $editor: String!, $isPublished: Boolean!, $isPrivate: Boolean!, $locale: String!, $path: String!, $publishEndDate: Date, $publishStartDate: Date, $scriptCss: String, $scriptJs: String, $tags: [String]!, $title: String!) {
@@ -388,7 +407,7 @@ async def wikijs_create_page(title: str, content: str, space_id: str = "", paren
             }
         }
         """
-        
+
         variables = {
             "content": content,
             "description": "",
@@ -404,12 +423,12 @@ async def wikijs_create_page(title: str, content: str, space_id: str = "", paren
             "tags": [],
             "title": title
         }
-        
+
         response = await wikijs.graphql_request(mutation, variables)
-        
+
         create_result = response.get("data", {}).get("pages", {}).get("create", {})
         response_result = create_result.get("responseResult", {})
-        
+
         if response_result.get("succeeded"):
             page_data = create_result.get("page", {})
             result = {
@@ -425,11 +444,12 @@ async def wikijs_create_page(title: str, content: str, space_id: str = "", paren
         else:
             error_msg = response_result.get("message", "Unknown error")
             return json.dumps({"error": f"Failed to create page: {error_msg}"})
-        
+
     except Exception as e:
         error_msg = f"Failed to create page '{title}': {str(e)}"
         logger.error(error_msg)
         return json.dumps({"error": error_msg})
+
 
 @mcp.tool()
 async def wikijs_update_page(page_id: int, title: str = None, content: str = None) -> str:
@@ -446,7 +466,7 @@ async def wikijs_update_page(page_id: int, title: str = None, content: str = Non
     """
     try:
         await wikijs.authenticate()
-        
+
         # First get the current page data
         get_query = """
         query($id: Int!) {
@@ -467,13 +487,13 @@ async def wikijs_update_page(page_id: int, title: str = None, content: str = Non
             }
         }
         """
-        
+
         get_response = await wikijs.graphql_request(get_query, {"id": page_id})
         current_page = get_response.get("data", {}).get("pages", {}).get("single")
-        
+
         if not current_page:
             return json.dumps({"error": f"Page with ID {page_id} not found"})
-        
+
         # GraphQL mutation to update a page
         mutation = """
         mutation($id: Int!, $content: String!, $description: String!, $editor: String!, $isPrivate: Boolean!, $isPublished: Boolean!, $locale: String!, $path: String!, $scriptCss: String, $scriptJs: String, $tags: [String]!, $title: String!) {
@@ -495,11 +515,11 @@ async def wikijs_update_page(page_id: int, title: str = None, content: str = Non
             }
         }
         """
-        
+
         # Use provided values or keep current ones
         new_title = title if title is not None else current_page["title"]
         new_content = content if content is not None else current_page["content"]
-        
+
         variables = {
             "id": page_id,
             "content": new_content,
@@ -514,12 +534,12 @@ async def wikijs_update_page(page_id: int, title: str = None, content: str = Non
             "tags": [tag["tag"] for tag in current_page.get("tags", [])],
             "title": new_title
         }
-        
+
         response = await wikijs.graphql_request(mutation, variables)
-        
+
         update_result = response.get("data", {}).get("pages", {}).get("update", {})
         response_result = update_result.get("responseResult", {})
-        
+
         if response_result.get("succeeded"):
             page_data = update_result.get("page", {})
             result = {
@@ -533,11 +553,12 @@ async def wikijs_update_page(page_id: int, title: str = None, content: str = Non
         else:
             error_msg = response_result.get("message", "Unknown error")
             return json.dumps({"error": f"Failed to update page: {error_msg}"})
-        
+
     except Exception as e:
         error_msg = f"Failed to update page {page_id}: {str(e)}"
         logger.error(error_msg)
         return json.dumps({"error": error_msg})
+
 
 @mcp.tool()
 async def wikijs_get_page(page_id: int = None, slug: str = None) -> str:
@@ -553,7 +574,7 @@ async def wikijs_get_page(page_id: int = None, slug: str = None) -> str:
     """
     try:
         await wikijs.authenticate()
-        
+
         if page_id:
             query = """
             query($id: Int!) {
@@ -602,18 +623,18 @@ async def wikijs_get_page(page_id: int = None, slug: str = None) -> str:
             variables = {"path": slug}
         else:
             return json.dumps({"error": "Either page_id or slug must be provided"})
-        
+
         response = await wikijs.graphql_request(query, variables)
-        
+
         page_data = None
         if page_id:
             page_data = response.get("data", {}).get("pages", {}).get("single")
         else:
             page_data = response.get("data", {}).get("pages", {}).get("singleByPath")
-        
+
         if not page_data:
             return json.dumps({"error": "Page not found"})
-        
+
         result = {
             "pageId": page_data.get("id"),
             "title": page_data.get("title"),
@@ -625,13 +646,14 @@ async def wikijs_get_page(page_id: int = None, slug: str = None) -> str:
             "description": page_data.get("description"),
             "tags": [tag["tag"] for tag in page_data.get("tags", [])]
         }
-        
+
         return json.dumps(result)
-        
+
     except Exception as e:
         error_msg = f"Failed to get page: {str(e)}"
         logger.error(error_msg)
         return json.dumps({"error": error_msg})
+
 
 @mcp.tool()
 async def wikijs_search_pages(query: str, space_id: str = None) -> str:
@@ -647,7 +669,7 @@ async def wikijs_search_pages(query: str, space_id: str = None) -> str:
     """
     try:
         await wikijs.authenticate()
-        
+
         # GraphQL query for search (fixed - removed invalid suggestions subfields)
         search_query = """
         query($query: String!) {
@@ -665,13 +687,13 @@ async def wikijs_search_pages(query: str, space_id: str = None) -> str:
             }
         }
         """
-        
+
         variables = {"query": query}
-        
+
         response = await wikijs.graphql_request(search_query, variables)
-        
+
         search_data = response.get("data", {}).get("pages", {}).get("search", {})
-        
+
         results = []
         for item in search_data.get("results", []):
             results.append({
@@ -681,16 +703,17 @@ async def wikijs_search_pages(query: str, space_id: str = None) -> str:
                 "score": 1.0,  # Wiki.js doesn't provide scores
                 "path": item.get("path")
             })
-        
+
         return json.dumps({
-            "results": results, 
+            "results": results,
             "total": search_data.get("totalHits", len(results))
         })
-        
+
     except Exception as e:
         error_msg = f"Search failed: {str(e)}"
         logger.error(error_msg)
         return json.dumps({"error": error_msg})
+
 
 @mcp.tool()
 async def wikijs_list_spaces() -> str:
@@ -703,7 +726,7 @@ async def wikijs_list_spaces() -> str:
     """
     try:
         await wikijs.authenticate()
-        
+
         # Get all pages and group by top-level paths
         query = """
         query {
@@ -719,11 +742,11 @@ async def wikijs_list_spaces() -> str:
             }
         }
         """
-        
+
         response = await wikijs.graphql_request(query)
-        
+
         pages = response.get("data", {}).get("pages", {}).get("list", [])
-        
+
         # Group pages by top-level path (simulate spaces)
         spaces = {}
         for page in pages:
@@ -739,13 +762,14 @@ async def wikijs_list_spaces() -> str:
                         "pageCount": 0
                     }
                 spaces[top_level]["pageCount"] += 1
-        
+
         return json.dumps({"spaces": list(spaces.values())})
-        
+
     except Exception as e:
         error_msg = f"Failed to list spaces: {str(e)}"
         logger.error(error_msg)
         return json.dumps({"error": error_msg})
+
 
 @mcp.tool()
 async def wikijs_create_space(name: str, description: str = None) -> str:
@@ -763,10 +787,10 @@ async def wikijs_create_space(name: str, description: str = None) -> str:
     try:
         # Create a root page that acts as a space
         space_content = f"# {name}\n\n{description or 'This is the main page for the ' + name + ' section.'}\n\n## Pages in this section:\n\n*Pages will be listed here as they are created.*"
-        
+
         result = await wikijs_create_page(name, space_content)
         result_data = json.loads(result)
-        
+
         if "error" not in result_data:
             # Convert page result to space format
             space_result = {
@@ -780,11 +804,12 @@ async def wikijs_create_space(name: str, description: str = None) -> str:
             return json.dumps(space_result)
         else:
             return result
-        
+
     except Exception as e:
         error_msg = f"Failed to create space '{name}': {str(e)}"
         logger.error(error_msg)
         return json.dumps({"error": error_msg})
+
 
 @mcp.tool()
 async def wikijs_link_file_to_page(file_path: str, page_id: int, relationship: str = "documents") -> str:
@@ -801,11 +826,11 @@ async def wikijs_link_file_to_page(file_path: str, page_id: int, relationship: s
     """
     try:
         db = get_db()
-        
+
         # Calculate file hash
         file_hash = get_file_hash(file_path)
         repo_root = find_repository_root(file_path)
-        
+
         # Create or update mapping
         mapping = db.query(FileMapping).filter(FileMapping.file_path == file_path).first()
         if mapping:
@@ -822,23 +847,24 @@ async def wikijs_link_file_to_page(file_path: str, page_id: int, relationship: s
                 repository_root=repo_root or ""
             )
             db.add(mapping)
-        
+
         db.commit()
-        
+
         result = {
             "linked": True,
             "file_path": file_path,
             "page_id": page_id,
             "relationship": relationship
         }
-        
+
         logger.info(f"Linked file {file_path} to page {page_id}")
         return json.dumps(result)
-        
+
     except Exception as e:
         error_msg = f"Failed to link file to page: {str(e)}"
         logger.error(error_msg)
         return json.dumps({"error": error_msg})
+
 
 @mcp.tool()
 async def wikijs_sync_file_docs(file_path: str, change_summary: str, snippet: str = None) -> str:
@@ -855,63 +881,64 @@ async def wikijs_sync_file_docs(file_path: str, change_summary: str, snippet: st
     """
     try:
         db = get_db()
-        
+
         # Look up page mapping
         mapping = db.query(FileMapping).filter(FileMapping.file_path == file_path).first()
         if not mapping:
             return json.dumps({"error": f"No page mapping found for {file_path}"})
-        
+
         # Get current page content
         page_response = await wikijs_get_page(page_id=mapping.page_id)
         page_data = json.loads(page_response)
-        
+
         if "error" in page_data:
             return json.dumps({"error": f"Failed to get page: {page_data['error']}"})
-        
+
         # Append change summary to page content
         current_content = page_data.get("content", "")
-        
+
         update_section = f"\n\n## Recent Changes\n\n**{datetime.datetime.now().strftime('%Y-%m-%d %H:%M')}**: {change_summary}\n"
         if snippet:
             update_section += f"\n```\n{snippet}\n```\n"
-        
+
         new_content = current_content + update_section
-        
+
         # Update the page
         update_response = await wikijs_update_page(mapping.page_id, content=new_content)
         update_data = json.loads(update_response)
-        
+
         if "error" in update_data:
             return json.dumps({"error": f"Failed to update page: {update_data['error']}"})
-        
+
         # Update file hash
         mapping.file_hash = get_file_hash(file_path)
         mapping.last_updated = datetime.datetime.utcnow()
         db.commit()
-        
+
         result = {
             "updated": True,
             "file_path": file_path,
             "page_id": mapping.page_id,
             "change_summary": change_summary
         }
-        
+
         logger.info(f"Synced changes from {file_path} to page {mapping.page_id}")
         return json.dumps(result)
-        
+
     except Exception as e:
         error_msg = f"Failed to sync file docs: {str(e)}"
         logger.error(error_msg)
         return json.dumps({"error": error_msg})
 
+
 @mcp.tool()
 async def wikijs_generate_file_overview(
-    file_path: str, 
-    include_functions: bool = True, 
-    include_classes: bool = True,
-    include_dependencies: bool = True,
-    include_examples: bool = False,
-    target_page_id: int = None
+        file_path: str,
+        include_functions: bool = True,
+        include_classes: bool = True,
+        include_dependencies: bool = True,
+        include_examples: bool = False,
+        target_page_id: int = None
 ) -> str:
     """
     Create or update a structured overview page for a file.
@@ -930,41 +957,41 @@ async def wikijs_generate_file_overview(
     try:
         if not os.path.exists(file_path):
             return json.dumps({"error": f"File not found: {file_path}"})
-        
+
         # Extract code structure
         structure = extract_code_structure(file_path)
-        
+
         # Generate documentation content
         content_parts = [f"# {os.path.basename(file_path)} Overview\n"]
         content_parts.append(f"**File Path**: `{file_path}`\n")
         content_parts.append(f"**Last Updated**: {datetime.datetime.now().strftime('%Y-%m-%d %H:%M')}\n")
-        
+
         if include_dependencies and structure['imports']:
             content_parts.append("\n## Dependencies\n")
             for imp in structure['imports']:
                 content_parts.append(f"- `{imp}`")
             content_parts.append("")
-        
+
         if include_classes and structure['classes']:
             content_parts.append("\n## Classes\n")
             for cls in structure['classes']:
                 content_parts.append(f"### {cls['name']} (Line {cls['line']})\n")
                 if cls['docstring']:
                     content_parts.append(f"{cls['docstring']}\n")
-        
+
         if include_functions and structure['functions']:
             content_parts.append("\n## Functions\n")
             for func in structure['functions']:
                 content_parts.append(f"### {func['name']}() (Line {func['line']})\n")
                 if func['docstring']:
                     content_parts.append(f"{func['docstring']}\n")
-        
+
         if include_examples:
             content_parts.append("\n## Usage Examples\n")
             content_parts.append("```python\n# Add usage examples here\n```\n")
-        
+
         content = "\n".join(content_parts)
-        
+
         # Create or update page
         if target_page_id:
             # Update existing page
@@ -982,21 +1009,22 @@ async def wikijs_generate_file_overview(
                 # Link file to new page
                 if "pageId" in result_data:
                     await wikijs_link_file_to_page(file_path, result_data["pageId"], "documents")
-        
+
         logger.info(f"Generated overview for {file_path}")
         return json.dumps(result_data)
-        
+
     except Exception as e:
         error_msg = f"Failed to generate file overview: {str(e)}"
         logger.error(error_msg)
         return json.dumps({"error": error_msg})
 
+
 @mcp.tool()
 async def wikijs_bulk_update_project_docs(
-    summary: str, 
-    affected_files: List[str], 
-    context: str,
-    auto_create_missing: bool = True
+        summary: str,
+        affected_files: List[str],
+        context: str,
+        auto_create_missing: bool = True
 ) -> str:
     """
     Batch update pages for large changes across multiple files.
@@ -1017,18 +1045,18 @@ async def wikijs_bulk_update_project_docs(
             "created_pages": [],
             "errors": []
         }
-        
+
         # Process each affected file
         for file_path in affected_files:
             try:
                 # Check if file has a mapping
                 mapping = db.query(FileMapping).filter(FileMapping.file_path == file_path).first()
-                
+
                 if mapping:
                     # Update existing page
                     sync_response = await wikijs_sync_file_docs(
-                        file_path, 
-                        f"Bulk update: {summary}", 
+                        file_path,
+                        f"Bulk update: {summary}",
                         context
                     )
                     sync_data = json.loads(sync_response)
@@ -1042,7 +1070,7 @@ async def wikijs_bulk_update_project_docs(
                             "file_path": file_path,
                             "error": sync_data["error"]
                         })
-                
+
                 elif auto_create_missing:
                     # Create new overview page
                     overview_response = await wikijs_generate_file_overview(file_path)
@@ -1057,27 +1085,28 @@ async def wikijs_bulk_update_project_docs(
                             "file_path": file_path,
                             "error": overview_data.get("error", "Failed to create page")
                         })
-                
+
             except Exception as e:
                 results["errors"].append({
                     "file_path": file_path,
                     "error": str(e)
                 })
-        
+
         results["summary"] = {
             "total_files": len(affected_files),
             "updated": len(results["updated_pages"]),
             "created": len(results["created_pages"]),
             "errors": len(results["errors"])
         }
-        
+
         logger.info(f"Bulk update completed: {results['summary']}")
         return json.dumps(results)
-        
+
     except Exception as e:
         error_msg = f"Bulk update failed: {str(e)}"
         logger.error(error_msg)
         return json.dumps({"error": error_msg})
+
 
 @mcp.tool()
 async def wikijs_manage_collections(collection_name: str, description: str = None, space_ids: List[int] = None) -> str:
@@ -1103,14 +1132,15 @@ async def wikijs_manage_collections(collection_name: str, description: str = Non
             "status": "managed",
             "note": "Collection management depends on Wiki.js version and configuration"
         }
-        
+
         logger.info(f"Managed collection: {collection_name}")
         return json.dumps(result)
-        
+
     except Exception as e:
         error_msg = f"Failed to manage collection: {str(e)}"
         logger.error(error_msg)
         return json.dumps({"error": error_msg})
+
 
 @mcp.tool()
 async def wikijs_connection_status() -> str:
@@ -1122,11 +1152,11 @@ async def wikijs_connection_status() -> str:
     """
     try:
         auth_success = await wikijs.authenticate()
-        
+
         if auth_success:
             # Test with a simple API call
             response = await wikijs.graphql_request("query { pages { list { id } } }")
-            
+
             result = {
                 "connected": True,
                 "authenticated": True,
@@ -1141,9 +1171,9 @@ async def wikijs_connection_status() -> str:
                 "api_url": settings.WIKIJS_API_URL,
                 "status": "authentication_failed"
             }
-        
+
         return json.dumps(result)
-        
+
     except Exception as e:
         result = {
             "connected": False,
@@ -1153,6 +1183,7 @@ async def wikijs_connection_status() -> str:
             "status": "connection_failed"
         }
         return json.dumps(result)
+
 
 @mcp.tool()
 async def wikijs_repository_context() -> str:
@@ -1165,17 +1196,17 @@ async def wikijs_repository_context() -> str:
     try:
         repo_root = find_repository_root()
         db = get_db()
-        
+
         # Get repository context from database
         context = db.query(RepositoryContext).filter(
             RepositoryContext.root_path == repo_root
         ).first()
-        
+
         # Get file mappings for this repository
         mappings = db.query(FileMapping).filter(
             FileMapping.repository_root == repo_root
         ).all()
-        
+
         result = {
             "repository_root": repo_root,
             "space_name": context.space_name if context else settings.DEFAULT_SPACE_NAME,
@@ -1191,13 +1222,14 @@ async def wikijs_repository_context() -> str:
                 for m in mappings[:10]  # Limit to first 10 for brevity
             ]
         }
-        
+
         return json.dumps(result)
-        
+
     except Exception as e:
         error_msg = f"Failed to get repository context: {str(e)}"
         logger.error(error_msg)
         return json.dumps({"error": error_msg})
+
 
 @mcp.tool()
 async def wikijs_create_repo_structure(repo_name: str, description: str = None, sections: List[str] = None) -> str:
@@ -1216,7 +1248,7 @@ async def wikijs_create_repo_structure(repo_name: str, description: str = None, 
         # Default sections if none provided
         if not sections:
             sections = ["Overview", "Getting Started", "Architecture", "API Reference", "Development", "Deployment"]
-        
+
         # Create root repository page
         root_content = f"""# {repo_name}
 
@@ -1227,10 +1259,10 @@ async def wikijs_create_repo_structure(repo_name: str, description: str = None, 
 This documentation is organized into the following sections:
 
 """
-        
+
         for section in sections:
             root_content += f"- [{section}]({slugify(repo_name)}/{slugify(section)})\n"
-        
+
         root_content += f"""
 
 ## Quick Links
@@ -1242,17 +1274,17 @@ This documentation is organized into the following sections:
 ---
 *This documentation structure was created by the Wiki.js MCP server.*
 """
-        
+
         # Create root page
         root_result = await wikijs_create_page(repo_name, root_content)
         root_data = json.loads(root_result)
-        
+
         if "error" in root_data:
             return json.dumps({"error": f"Failed to create root page: {root_data['error']}"})
-        
+
         root_page_id = root_data["pageId"]
         created_pages = [root_data]
-        
+
         # Create section pages
         for section in sections:
             section_content = f"""# {section}
@@ -1270,15 +1302,15 @@ This is the {section.lower()} section for {repo_name}.
 ---
 *This page is part of the {repo_name} documentation structure.*
 """
-            
+
             section_result = await wikijs_create_page(section, section_content, parent_id=str(root_page_id))
             section_data = json.loads(section_result)
-            
+
             if "error" not in section_data:
                 created_pages.append(section_data)
             else:
                 logger.warning(f"Failed to create section '{section}': {section_data['error']}")
-        
+
         result = {
             "repository": repo_name,
             "root_page_id": root_page_id,
@@ -1287,17 +1319,19 @@ This is the {section.lower()} section for {repo_name}.
             "pages": created_pages,
             "status": "created"
         }
-        
+
         logger.info(f"Created repository structure for {repo_name} with {len(created_pages)} pages")
         return json.dumps(result)
-        
+
     except Exception as e:
         error_msg = f"Failed to create repository structure: {str(e)}"
         logger.error(error_msg)
         return json.dumps({"error": error_msg})
 
+
 @mcp.tool()
-async def wikijs_create_nested_page(title: str, content: str, parent_path: str, create_parent_if_missing: bool = True) -> str:
+async def wikijs_create_nested_page(title: str, content: str, parent_path: str,
+                                    create_parent_if_missing: bool = True) -> str:
     """
     Create a nested page using hierarchical paths (e.g., "repo/api/endpoints").
     
@@ -1312,7 +1346,7 @@ async def wikijs_create_nested_page(title: str, content: str, parent_path: str, 
     """
     try:
         await wikijs.authenticate()
-        
+
         # Check if parent exists
         parent_query = """
         query($path: String!) {
@@ -1325,26 +1359,26 @@ async def wikijs_create_nested_page(title: str, content: str, parent_path: str, 
             }
         }
         """
-        
+
         parent_response = await wikijs.graphql_request(parent_query, {"path": parent_path})
         parent_data = parent_response.get("data", {}).get("pages", {}).get("singleByPath")
-        
+
         if not parent_data and create_parent_if_missing:
             # Create parent structure
             path_parts = parent_path.split("/")
             current_path = ""
             parent_id = None
-            
+
             for i, part in enumerate(path_parts):
                 if current_path:
                     current_path += f"/{part}"
                 else:
                     current_path = part
-                
+
                 # Check if this level exists
                 check_response = await wikijs.graphql_request(parent_query, {"path": current_path})
                 existing = check_response.get("data", {}).get("pages", {}).get("singleByPath")
-                
+
                 if not existing:
                     # Create this level
                     part_title = part.replace("-", " ").title()
@@ -1359,36 +1393,39 @@ This is a section page for organizing documentation.
 ---
 *This page was auto-created as part of the documentation hierarchy.*
 """
-                    
-                    create_result = await wikijs_create_page(part_title, part_content, parent_id=str(parent_id) if parent_id else "")
+
+                    create_result = await wikijs_create_page(part_title, part_content,
+                                                             parent_id=str(parent_id) if parent_id else "")
                     create_data = json.loads(create_result)
-                    
+
                     if "error" not in create_data:
                         parent_id = create_data["pageId"]
                     else:
-                        return json.dumps({"error": f"Failed to create parent '{current_path}': {create_data['error']}"})
+                        return json.dumps(
+                            {"error": f"Failed to create parent '{current_path}': {create_data['error']}"})
                 else:
                     parent_id = existing["id"]
-        
+
         elif parent_data:
             parent_id = parent_data["id"]
         else:
             return json.dumps({"error": f"Parent path '{parent_path}' not found and create_parent_if_missing is False"})
-        
+
         # Create the target page
         result = await wikijs_create_page(title, content, parent_id=str(parent_id))
         result_data = json.loads(result)
-        
+
         if "error" not in result_data:
             result_data["parent_path"] = parent_path
             result_data["full_path"] = f"{parent_path}/{slugify(title)}"
-        
+
         return json.dumps(result_data)
-        
+
     except Exception as e:
         error_msg = f"Failed to create nested page: {str(e)}"
         logger.error(error_msg)
         return json.dumps({"error": error_msg})
+
 
 @mcp.tool()
 async def wikijs_get_page_children(page_id: int = None, page_path: str = None) -> str:
@@ -1404,7 +1441,7 @@ async def wikijs_get_page_children(page_id: int = None, page_path: str = None) -
     """
     try:
         await wikijs.authenticate()
-        
+
         # Get the parent page first
         if page_id:
             parent_query = """
@@ -1436,12 +1473,12 @@ async def wikijs_get_page_children(page_id: int = None, page_path: str = None) -
             parent_data = parent_response.get("data", {}).get("pages", {}).get("singleByPath")
         else:
             return json.dumps({"error": "Either page_id or page_path must be provided"})
-        
+
         if not parent_data:
             return json.dumps({"error": "Parent page not found"})
-        
+
         parent_path = parent_data["path"]
-        
+
         # Get all pages and filter for children
         all_pages_query = """
         query {
@@ -1457,10 +1494,10 @@ async def wikijs_get_page_children(page_id: int = None, page_path: str = None) -
             }
         }
         """
-        
+
         response = await wikijs.graphql_request(all_pages_query)
         all_pages = response.get("data", {}).get("pages", {}).get("list", [])
-        
+
         # Filter for direct children (path starts with parent_path/ but no additional slashes)
         children = []
         for page in all_pages:
@@ -1477,7 +1514,7 @@ async def wikijs_get_page_children(page_id: int = None, page_path: str = None) -
                         "lastModified": page.get("updatedAt"),
                         "isPublished": page.get("isPublished", True)
                     })
-        
+
         result = {
             "parent": {
                 "pageId": parent_data["id"],
@@ -1487,16 +1524,18 @@ async def wikijs_get_page_children(page_id: int = None, page_path: str = None) -
             "children": children,
             "total_children": len(children)
         }
-        
+
         return json.dumps(result)
-        
+
     except Exception as e:
         error_msg = f"Failed to get page children: {str(e)}"
         logger.error(error_msg)
         return json.dumps({"error": error_msg})
 
+
 @mcp.tool()
-async def wikijs_create_documentation_hierarchy(project_name: str, file_mappings: List[Dict[str, str]], auto_organize: bool = True) -> str:
+async def wikijs_create_documentation_hierarchy(project_name: str, file_mappings: List[Dict[str, str]],
+                                                auto_organize: bool = True) -> str:
     """
     Create a complete documentation hierarchy for a project based on file structure.
     
@@ -1521,10 +1560,10 @@ async def wikijs_create_documentation_hierarchy(project_name: str, file_mappings
                 "config": [],
                 "docs": []
             }
-            
+
             for mapping in file_mappings:
                 file_path = mapping["file_path"].lower()
-                
+
                 if "component" in file_path or "/components/" in file_path:
                     sections["components"].append(mapping)
                 elif "api" in file_path or "/api/" in file_path or "endpoint" in file_path:
@@ -1541,42 +1580,44 @@ async def wikijs_create_documentation_hierarchy(project_name: str, file_mappings
                     sections["config"].append(mapping)
                 else:
                     sections["docs"].append(mapping)
-        
+
         # Create root project structure
-        section_names = [name.title() for name, files in sections.items() if files] if auto_organize else ["Documentation"]
-        
-        repo_result = await wikijs_create_repo_structure(project_name, f"Documentation for {project_name}", section_names)
+        section_names = [name.title() for name, files in sections.items() if files] if auto_organize else [
+            "Documentation"]
+
+        repo_result = await wikijs_create_repo_structure(project_name, f"Documentation for {project_name}",
+                                                         section_names)
         repo_data = json.loads(repo_result)
-        
+
         if "error" in repo_data:
             return repo_result
-        
+
         created_pages = []
         created_mappings = []
-        
+
         if auto_organize:
             # Create pages for each section
             for section_name, files in sections.items():
                 if not files:
                     continue
-                
+
                 section_title = section_name.title()
-                
+
                 for file_mapping in files:
                     file_path = file_mapping["file_path"]
                     doc_path = file_mapping.get("doc_path", slugify(os.path.basename(file_path)))
-                    
+
                     # Generate documentation content for the file
                     file_overview_result = await wikijs_generate_file_overview(file_path, target_page_id=None)
                     overview_data = json.loads(file_overview_result)
-                    
+
                     if "error" not in overview_data:
                         created_pages.append(overview_data)
-                        
+
                         # Create mapping
                         mapping_result = await wikijs_link_file_to_page(file_path, overview_data["pageId"], "documents")
                         mapping_data = json.loads(mapping_result)
-                        
+
                         if "error" not in mapping_data:
                             created_mappings.append(mapping_data)
         else:
@@ -1584,7 +1625,7 @@ async def wikijs_create_documentation_hierarchy(project_name: str, file_mappings
             for file_mapping in file_mappings:
                 file_path = file_mapping["file_path"]
                 doc_path = file_mapping.get("doc_path", f"{project_name}/{slugify(os.path.basename(file_path))}")
-                
+
                 # Create nested page
                 nested_result = await wikijs_create_nested_page(
                     os.path.basename(file_path),
@@ -1592,17 +1633,17 @@ async def wikijs_create_documentation_hierarchy(project_name: str, file_mappings
                     doc_path
                 )
                 nested_data = json.loads(nested_result)
-                
+
                 if "error" not in nested_data:
                     created_pages.append(nested_data)
-                    
+
                     # Create mapping
                     mapping_result = await wikijs_link_file_to_page(file_path, nested_data["pageId"], "documents")
                     mapping_data = json.loads(mapping_result)
-                    
+
                     if "error" not in mapping_data:
                         created_mappings.append(mapping_data)
-        
+
         result = {
             "project": project_name,
             "root_structure": repo_data,
@@ -1614,14 +1655,16 @@ async def wikijs_create_documentation_hierarchy(project_name: str, file_mappings
             "mappings": created_mappings[:10],  # Limit output
             "status": "completed"
         }
-        
-        logger.info(f"Created documentation hierarchy for {project_name}: {len(created_pages)} pages, {len(created_mappings)} mappings")
+
+        logger.info(
+            f"Created documentation hierarchy for {project_name}: {len(created_pages)} pages, {len(created_mappings)} mappings")
         return json.dumps(result)
-        
+
     except Exception as e:
         error_msg = f"Failed to create documentation hierarchy: {str(e)}"
         logger.error(error_msg)
         return json.dumps({"error": error_msg})
+
 
 @mcp.tool()
 async def wikijs_delete_page(page_id: int = None, page_path: str = None, remove_file_mapping: bool = True) -> str:
@@ -1638,7 +1681,7 @@ async def wikijs_delete_page(page_id: int = None, page_path: str = None, remove_
     """
     try:
         await wikijs.authenticate()
-        
+
         # Get page info first
         if page_id:
             get_query = """
@@ -1672,10 +1715,10 @@ async def wikijs_delete_page(page_id: int = None, page_path: str = None, remove_
                 page_id = page_data["id"]
         else:
             return json.dumps({"error": "Either page_id or page_path must be provided"})
-        
+
         if not page_data:
             return json.dumps({"error": "Page not found"})
-        
+
         # Delete the page using GraphQL mutation
         delete_mutation = """
         mutation($id: Int!) {
@@ -1691,12 +1734,12 @@ async def wikijs_delete_page(page_id: int = None, page_path: str = None, remove_
             }
         }
         """
-        
+
         response = await wikijs.graphql_request(delete_mutation, {"id": page_id})
-        
+
         delete_result = response.get("data", {}).get("pages", {}).get("delete", {})
         response_result = delete_result.get("responseResult", {})
-        
+
         if response_result.get("succeeded"):
             result = {
                 "deleted": True,
@@ -1705,7 +1748,7 @@ async def wikijs_delete_page(page_id: int = None, page_path: str = None, remove_
                 "path": page_data["path"],
                 "status": "deleted"
             }
-            
+
             # Remove file mapping if requested
             if remove_file_mapping:
                 db = get_db()
@@ -1716,25 +1759,26 @@ async def wikijs_delete_page(page_id: int = None, page_path: str = None, remove_
                     result["file_mapping_removed"] = True
                 else:
                     result["file_mapping_removed"] = False
-            
+
             logger.info(f"Deleted page: {page_data['title']} (ID: {page_id})")
             return json.dumps(result)
         else:
             error_msg = response_result.get("message", "Unknown error")
             return json.dumps({"error": f"Failed to delete page: {error_msg}"})
-        
+
     except Exception as e:
         error_msg = f"Failed to delete page: {str(e)}"
         logger.error(error_msg)
         return json.dumps({"error": error_msg})
 
+
 @mcp.tool()
 async def wikijs_batch_delete_pages(
-    page_ids: List[int] = None, 
-    page_paths: List[str] = None,
-    path_pattern: str = None,
-    confirm_deletion: bool = False,
-    remove_file_mappings: bool = True
+        page_ids: List[int] = None,
+        page_paths: List[str] = None,
+        path_pattern: str = None,
+        confirm_deletion: bool = False,
+        remove_file_mappings: bool = True
 ) -> str:
     """
     Batch delete multiple pages from Wiki.js.
@@ -1755,11 +1799,11 @@ async def wikijs_batch_delete_pages(
                 "error": "confirm_deletion must be True to proceed with batch deletion",
                 "safety_note": "This is a safety check to prevent accidental deletions"
             })
-        
+
         await wikijs.authenticate()
-        
+
         pages_to_delete = []
-        
+
         # Collect pages by IDs
         if page_ids:
             for page_id in page_ids:
@@ -1778,7 +1822,7 @@ async def wikijs_batch_delete_pages(
                 page_data = get_response.get("data", {}).get("pages", {}).get("single")
                 if page_data:
                     pages_to_delete.append(page_data)
-        
+
         # Collect pages by paths
         if page_paths:
             for page_path in page_paths:
@@ -1797,7 +1841,7 @@ async def wikijs_batch_delete_pages(
                 page_data = get_response.get("data", {}).get("pages", {}).get("singleByPath")
                 if page_data:
                     pages_to_delete.append(page_data)
-        
+
         # Collect pages by pattern
         if path_pattern:
             # Get all pages and filter by pattern
@@ -1812,37 +1856,37 @@ async def wikijs_batch_delete_pages(
                 }
             }
             """
-            
+
             response = await wikijs.graphql_request(all_pages_query)
             all_pages = response.get("data", {}).get("pages", {}).get("list", [])
-            
+
             # Simple pattern matching (supports * wildcard)
             import fnmatch
             for page in all_pages:
                 if fnmatch.fnmatch(page["path"], path_pattern):
                     pages_to_delete.append(page)
-        
+
         if not pages_to_delete:
             return json.dumps({"error": "No pages found to delete"})
-        
+
         # Remove duplicates
         unique_pages = {}
         for page in pages_to_delete:
             unique_pages[page["id"]] = page
         pages_to_delete = list(unique_pages.values())
-        
+
         # Delete pages
         deleted_pages = []
         failed_deletions = []
-        
+
         for page in pages_to_delete:
             try:
                 delete_result = await wikijs_delete_page(
-                    page_id=page["id"], 
+                    page_id=page["id"],
                     remove_file_mapping=remove_file_mappings
                 )
                 delete_data = json.loads(delete_result)
-                
+
                 if "error" not in delete_data:
                     deleted_pages.append({
                         "pageId": page["id"],
@@ -1863,7 +1907,7 @@ async def wikijs_batch_delete_pages(
                     "path": page["path"],
                     "error": str(e)
                 })
-        
+
         result = {
             "total_found": len(pages_to_delete),
             "deleted_count": len(deleted_pages),
@@ -1872,21 +1916,22 @@ async def wikijs_batch_delete_pages(
             "failed_deletions": failed_deletions,
             "status": "completed"
         }
-        
+
         logger.info(f"Batch deletion completed: {len(deleted_pages)} deleted, {len(failed_deletions)} failed")
         return json.dumps(result)
-        
+
     except Exception as e:
         error_msg = f"Batch deletion failed: {str(e)}"
         logger.error(error_msg)
         return json.dumps({"error": error_msg})
 
+
 @mcp.tool()
 async def wikijs_delete_hierarchy(
-    root_path: str,
-    delete_mode: str = "children_only",
-    confirm_deletion: bool = False,
-    remove_file_mappings: bool = True
+        root_path: str,
+        delete_mode: str = "children_only",
+        confirm_deletion: bool = False,
+        remove_file_mappings: bool = True
 ) -> str:
     """
     Delete an entire page hierarchy (folder structure) from Wiki.js.
@@ -1907,15 +1952,15 @@ async def wikijs_delete_hierarchy(
                 "safety_note": "This is a safety check to prevent accidental deletions",
                 "preview_mode": "Set confirm_deletion=True to actually delete"
             })
-        
+
         valid_modes = ["children_only", "include_root", "root_only"]
         if delete_mode not in valid_modes:
             return json.dumps({
                 "error": f"Invalid delete_mode. Must be one of: {valid_modes}"
             })
-        
+
         await wikijs.authenticate()
-        
+
         # Get all pages to find hierarchy
         all_pages_query = """
         query {
@@ -1928,37 +1973,37 @@ async def wikijs_delete_hierarchy(
             }
         }
         """
-        
+
         response = await wikijs.graphql_request(all_pages_query)
         all_pages = response.get("data", {}).get("pages", {}).get("list", [])
-        
+
         # Find root page
         root_page = None
         for page in all_pages:
             if page["path"] == root_path:
                 root_page = page
                 break
-        
+
         if not root_page and delete_mode in ["include_root", "root_only"]:
             return json.dumps({"error": f"Root page not found: {root_path}"})
-        
+
         # Find child pages
         child_pages = []
         for page in all_pages:
             page_path = page["path"]
             if page_path.startswith(f"{root_path}/"):
                 child_pages.append(page)
-        
+
         # Determine pages to delete based on mode
         pages_to_delete = []
-        
+
         if delete_mode == "children_only":
             pages_to_delete = child_pages
         elif delete_mode == "include_root":
             pages_to_delete = child_pages + ([root_page] if root_page else [])
         elif delete_mode == "root_only":
             pages_to_delete = [root_page] if root_page else []
-        
+
         if not pages_to_delete:
             return json.dumps({
                 "message": f"No pages found to delete for path: {root_path}",
@@ -1966,22 +2011,22 @@ async def wikijs_delete_hierarchy(
                 "root_found": root_page is not None,
                 "children_found": len(child_pages)
             })
-        
+
         # Sort by depth (deepest first) to avoid dependency issues
         pages_to_delete.sort(key=lambda x: x["path"].count("/"), reverse=True)
-        
+
         # Delete pages
         deleted_pages = []
         failed_deletions = []
-        
+
         for page in pages_to_delete:
             try:
                 delete_result = await wikijs_delete_page(
-                    page_id=page["id"], 
+                    page_id=page["id"],
                     remove_file_mapping=remove_file_mappings
                 )
                 delete_data = json.loads(delete_result)
-                
+
                 if "error" not in delete_data:
                     deleted_pages.append({
                         "pageId": page["id"],
@@ -2003,7 +2048,7 @@ async def wikijs_delete_hierarchy(
                     "path": page["path"],
                     "error": str(e)
                 })
-        
+
         result = {
             "root_path": root_path,
             "delete_mode": delete_mode,
@@ -2019,14 +2064,16 @@ async def wikijs_delete_hierarchy(
             },
             "status": "completed"
         }
-        
-        logger.info(f"Hierarchy deletion completed for {root_path}: {len(deleted_pages)} deleted, {len(failed_deletions)} failed")
+
+        logger.info(
+            f"Hierarchy deletion completed for {root_path}: {len(deleted_pages)} deleted, {len(failed_deletions)} failed")
         return json.dumps(result)
-        
+
     except Exception as e:
         error_msg = f"Hierarchy deletion failed: {str(e)}"
         logger.error(error_msg)
         return json.dumps({"error": error_msg})
+
 
 @mcp.tool()
 async def wikijs_cleanup_orphaned_mappings() -> str:
@@ -2039,20 +2086,20 @@ async def wikijs_cleanup_orphaned_mappings() -> str:
     try:
         await wikijs.authenticate()
         db = get_db()
-        
+
         # Get all file mappings
         mappings = db.query(FileMapping).all()
-        
+
         if not mappings:
             return json.dumps({
                 "message": "No file mappings found",
                 "cleaned_count": 0
             })
-        
+
         # Check which pages still exist
         orphaned_mappings = []
         valid_mappings = []
-        
+
         for mapping in mappings:
             try:
                 get_query = """
@@ -2068,7 +2115,7 @@ async def wikijs_cleanup_orphaned_mappings() -> str:
                 """
                 get_response = await wikijs.graphql_request(get_query, {"id": mapping.page_id})
                 page_data = get_response.get("data", {}).get("pages", {}).get("single")
-                
+
                 if page_data:
                     valid_mappings.append({
                         "file_path": mapping.file_path,
@@ -2083,7 +2130,7 @@ async def wikijs_cleanup_orphaned_mappings() -> str:
                     })
                     # Delete orphaned mapping
                     db.delete(mapping)
-                    
+
             except Exception as e:
                 # If we can't check the page, consider it orphaned
                 orphaned_mappings.append({
@@ -2092,9 +2139,9 @@ async def wikijs_cleanup_orphaned_mappings() -> str:
                     "error": str(e)
                 })
                 db.delete(mapping)
-        
+
         db.commit()
-        
+
         result = {
             "total_mappings": len(mappings),
             "valid_mappings": len(valid_mappings),
@@ -2103,23 +2150,23 @@ async def wikijs_cleanup_orphaned_mappings() -> str:
             "orphaned_details": orphaned_mappings,
             "status": "completed"
         }
-        
+
         logger.info(f"Cleaned up {len(orphaned_mappings)} orphaned file mappings")
         return json.dumps(result)
-        
+
     except Exception as e:
         error_msg = f"Cleanup failed: {str(e)}"
         logger.error(error_msg)
         return json.dumps({"error": error_msg})
 
+
 def main():
     """Main entry point for the MCP server."""
-    import asyncio
-    
+
     async def run_server():
         await wikijs.authenticate()
         logger.info("Wiki.js MCP Server started")
-        
+
     # Run the server over HTTP (required for OIDC login via Keycloak)
     mcp.run(
         transport="http",
@@ -2127,5 +2174,6 @@ def main():
         port=int(os.getenv("MCP_HTTP_PORT", "8000")),
     )
 
+
 if __name__ == "__main__":
-    main() 
+    main()
